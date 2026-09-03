@@ -21,4 +21,4 @@ The candidate reviewed the generated code and documentation, tested the main flo
 
 ## Conversation History
 
-The complete Copilot conversation history is retained in the local VS Code Copilot session history. The submitted repository includes this summary for disclosure. If the evaluator requires the raw transcript, export or attach the relevant VS Code Copilot conversation transcript from the development environment separately; it is not embedded in the source repository because it contains editor and machine metadata.
+The complete exported Copilot conversation is included in the repository as `AI_CONVERSATION_HISTORY.jsonl`. It is the raw VS Code Copilot session transcript, containing the conversation messages, tool actions, and validation history. It can be attached to the submission email if the evaluator requests the full history separately from the source-code repository.

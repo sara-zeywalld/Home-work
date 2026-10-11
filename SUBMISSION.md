@@ -71,29 +71,161 @@ The implementation uses EF Core conventions for foreign keys and `EnsureCreated`
 
 ## 4. SQL Queries and Procedures
 
-The application uses EF Core LINQ, which generates parameterized SQL. SQLite does not require stored procedures for this design.
+The application does not use stored procedures or hand-written SQL commands. It uses EF Core LINQ, which generates parameterized SQLite SQL. The statements below are representative SQL for every database operation implemented by the repositories and startup seed logic. EF Core may change aliases, parameter names, or combine statements when it executes them.
 
-Conceptual paginated query:
+### Read operations
+
+Get all premium methods and their metrics (`GET /api/premium-methods`):
 
 ```sql
-SELECT r.Id, r.ImportBatchId, r.ValuesJson
-FROM MetricRows r
-JOIN ImportBatches b ON b.Id = r.ImportBatchId
-WHERE b.MetricId = @metricId
-  AND (@search = '' OR r.ValuesJson LIKE '%' || @search || '%')
-ORDER BY r.Id DESC
-LIMIT @pageSize OFFSET @offset;
+SELECT p.*, m.*
+FROM PremiumMethods AS p
+LEFT JOIN Metrics AS m ON m.PremiumMethodId = p.Id;
 ```
 
-Import history query:
+Get all metrics and their fields (`GET /api/metrics`):
 
 ```sql
-SELECT Id, FileName, PeriodYear, PeriodLabel, SchemaVersion,
-       RowCount, Status, ImportedAtUtc
+SELECT m.*, f.*
+FROM Metrics AS m
+LEFT JOIN MetricFields AS f ON f.MetricId = m.Id;
+```
+
+Get one metric with its fields, used before reading rows or importing a file:
+
+```sql
+SELECT m.*, f.*
+FROM Metrics AS m
+LEFT JOIN MetricFields AS f ON f.MetricId = m.Id
+WHERE m.Id = @metricId;
+```
+
+Get import history (`GET /api/metrics/{id}/imports`):
+
+```sql
+SELECT Id, MetricId, SchemaVersion, PeriodYear, PeriodLabel,
+     FileName, ImportedAtUtc, RowCount, Status
 FROM ImportBatches
 WHERE MetricId = @metricId
 ORDER BY ImportedAtUtc DESC;
 ```
+
+Find rows that belong to a metric. The LINQ `Any` expression becomes an `EXISTS` subquery:
+
+```sql
+SELECT r.Id, r.ImportBatchId, r.ValuesJson
+FROM MetricRows AS r
+WHERE EXISTS (
+  SELECT 1
+  FROM ImportBatches AS b
+  WHERE b.Id = r.ImportBatchId
+    AND b.MetricId = @metricId
+);
+```
+
+Count matching rows for pagination:
+
+```sql
+SELECT COUNT(*)
+FROM MetricRows AS r
+WHERE EXISTS (
+  SELECT 1
+  FROM ImportBatches AS b
+  WHERE b.Id = r.ImportBatchId
+    AND b.MetricId = @metricId
+)
+  AND r.ValuesJson LIKE '%' || @search || '%';
+```
+
+The `LIKE` condition is added only when the user supplies a non-empty search value. Fetch one page of rows:
+
+```sql
+SELECT r.Id, r.ImportBatchId, r.ValuesJson
+FROM MetricRows AS r
+WHERE EXISTS (
+  SELECT 1
+  FROM ImportBatches AS b
+  WHERE b.Id = r.ImportBatchId
+    AND b.MetricId = @metricId
+)
+  AND r.ValuesJson LIKE '%' || @search || '%'
+ORDER BY r.Id DESC
+LIMIT @pageSize OFFSET @offset;
+```
+
+`@offset` is calculated as `(@page - 1) * @pageSize`.
+
+### Write operations
+
+Create a premium method (`POST /api/premium-methods`):
+
+```sql
+INSERT INTO PremiumMethods
+  (Number, Description, PremiumPercent, CalculationPeriod)
+VALUES
+  (@number, @description, @premiumPercent, @calculationPeriod);
+```
+
+Create a metric (`POST /api/metrics`):
+
+```sql
+INSERT INTO Metrics
+  (PremiumMethodId, Code, Name, Description, SourceType,
+   SourceName, IngestionFrequency)
+VALUES
+  (@premiumMethodId, @code, @name, @description, @sourceType,
+   @sourceName, @ingestionFrequency);
+```
+
+When an imported file contains a new field, EF Core inserts it into `MetricFields`:
+
+```sql
+INSERT INTO MetricFields
+  (MetricId, Version, Key, Label, DataType, IsRelevant, DisplayOrder)
+VALUES
+  (@metricId, @version, @key, @label, @dataType, @isRelevant, @displayOrder);
+```
+
+When an existing inactive field appears again, the import activates it:
+
+```sql
+UPDATE MetricFields
+SET IsRelevant = 1
+WHERE Id = @fieldId;
+```
+
+Create an import batch (`POST /api/metrics/{id}/import`):
+
+```sql
+INSERT INTO ImportBatches
+  (MetricId, SchemaVersion, PeriodYear, PeriodLabel, FileName,
+   ImportedAtUtc, RowCount, Status)
+VALUES
+  (@metricId, @schemaVersion, @periodYear, @periodLabel, @fileName,
+   @importedAtUtc, @rowCount, @status);
+```
+
+Insert each imported row as JSON:
+
+```sql
+INSERT INTO MetricRows
+  (ImportBatchId, ValuesJson)
+VALUES
+  (@importBatchId, @valuesJson);
+```
+
+### Startup database operations
+
+At startup, `EnsureCreated` creates the SQLite schema if it does not exist. The seed logic then checks whether data already exists:
+
+```sql
+SELECT EXISTS (
+  SELECT 1
+  FROM PremiumMethods
+);
+```
+
+If the database is empty, it executes the same `INSERT` operations shown above for the sample premium method, metric, fields, import batch, and three sample rows. Each `SaveChangesAsync` call is translated into one or more parameterized `INSERT` or `UPDATE` statements, usually inside an EF Core transaction.
 
 The API validates the metric and requested page size before querying. In a production version, dynamic filters and sorting would whitelist field keys and use SQLite JSON functions or typed projections rather than arbitrary SQL fragments.
 
@@ -168,11 +300,19 @@ PM-2026-01    | Annual ...  | 7.5        | Quarterly           | Edit
 ### Screen 2: Metrics
 
 ```text
-Metrics                                  [+ New metric]
+Metrics
+------------------------------------------------------------
+Active metric: [ Employees v ]             [+ New metric]
 
-Active metric [Employees v] [New metric]
-Code [stores]   Name [Stores]   Description [...]   Source [Excel]
-                                                [Create metric]
+Available metrics
+Code       | Name       | Source | Frequency
+employees  | Employees  | Excel  | Quarterly
+stores     | Stores     | Excel  | Monthly
+
+When [+ New metric] is selected:
+Code [ stores ]   Name [ Stores ]   Source [ Excel v ]
+Description [ Store sales and transaction data          ]
+Frequency [ Monthly v ]                         [Create metric]
 ```
 
 ### Screen 3: Import and view data
@@ -233,7 +373,14 @@ The import response contains the batch ID, file name, row count, and schema vers
 
 ### How does a changed Employees file work?
 
-The existing Employees metric can receive a file with additional headers such as `manager` and `location`. The importer creates missing field definitions, activates matching existing fields, stores the values in JSON, and records the batch schema version. No database table migration is required.
+The existing Employees metric can receive a file with additional headers such as `manager` and `location`.
+
+- **Detection:** the importer reads the header row and compares each header with the metric's `MetricField` definitions. Missing headers are created automatically.
+- **Database:** no migration is required. The new fields are rows in `MetricField`, while row values remain in `MetricRow.ValuesJson`.
+- **Code:** no change is required for additive columns. Validation, typed parsing, required fields, or renamed-column mapping would require additional code.
+- **Configuration:** no manual configuration is required in the current implementation. A future field-mapping screen could control labels, types, relevance, and aliases.
+- **History:** `ImportBatch.SchemaVersion` and `MetricField.Version` record the schema version information. A production system should add immutable schema snapshots for a complete historical definition.
+- **Compatibility:** old JSON rows remain unchanged. Their missing new values are displayed as empty or `—`; new rows contain the additional properties.
 
 ### How are large data volumes handled?
 
